@@ -1,9 +1,10 @@
-use std::{env, error::Error, fs::{self, File}, io::{Read, Seek, SeekFrom, Write}, os::unix::fs::FileExt, path::{Path, PathBuf}, process::exit, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc}, u64};
+use std::{env, error::Error, fs::{self, File}, io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write}, os::unix::fs::FileExt, path::{Path, PathBuf}, process::exit, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc}, u64};
 
 use flume::Receiver;
 use gzp::{check::{Adler32, Check}, deflate::Zlib, par::compress::{ParCompress, ParCompressBuilder}, FormatSpec};
 use indicatif::{MultiProgress, ProgressBar};
 use serde::{Deserialize, Serialize};
+use serde_json::Deserializer;
 
 const EXT: &str = "zlib";
 const EXT_PARTIAL: &str = "comp_dat";
@@ -233,10 +234,10 @@ impl FileToCompress {
 
             let compressor_config = CompressorState::from_file(&self.stp_filename).unwrap();
             builder = builder.dictionary(compressor_config.dictionary.map(|v| v.into()));
-            let check = Adler32 {
-                sum: compressor_config.check_sum,
-                amount: compressor_config.check_amount,
-            };
+
+            let mut deserializer = serde_json::Deserializer::from_str(&compressor_config.checksum_serialized);
+
+            let check = Adler32::to_deserialized(&mut deserializer)?;
 
             builder = builder.checksum(Some(check.into()));
 
@@ -254,8 +255,7 @@ impl FileToCompress {
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct CompressorState {
-    pub check_sum: u32,
-    pub check_amount: u32,
+    pub checksum_serialized: String,
     pub dictionary: Option<Vec<u8>>,
     pub total_byte_count: u64,
 }
@@ -265,12 +265,12 @@ impl CompressorState {
     /// Creates a new instance of the [`CompressorState`].
     pub fn new(checksum: impl Check + Send, dictionary: Option<Vec<u8>>, total_byte_count: u64) -> Self {
 
-        let check_sum = checksum.sum();
-        let check_amount = checksum.amount();
+        let mut serializer = serde_json::Serializer::new(Vec::new());
+        checksum.to_serialized(&mut serializer).unwrap();
+        let checksum_serialized = String::from_utf8_lossy(&serializer.into_inner()).to_string();
 
         return Self {
-            check_sum,
-            check_amount,
+            checksum_serialized,
             dictionary,
             total_byte_count,
         };

@@ -271,7 +271,7 @@ dependencies = [
 [[package]]
 name = "gzp"
 version = "1.0.1"
-source = "git+https://github.com/some1and2-xc/gzp.git#aa66594b067315c51b2df2dcaa4569bb15b5c09d"
+source = "git+https://github.com/some1and2-xc/gzp.git#f47e1eaf8cf8f65db2645a336fa0f02a0529662a"
 dependencies = [
  "byteorder",
  "bytes",
@@ -282,6 +282,7 @@ dependencies = [
  "libz-ng-sys",
  "log",
  "num_cpus",
+ "serde",
  "thiserror",
 ]
 
