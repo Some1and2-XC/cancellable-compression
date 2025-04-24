@@ -1,10 +1,9 @@
-use std::{env, error::Error, fs::{self, File}, io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write}, os::unix::fs::FileExt, path::{Path, PathBuf}, process::exit, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc}, u64};
+use std::{env, error::Error, ffi::OsString, fs::{self, File}, io::{Read, Seek, SeekFrom, Write}, os::unix::fs::FileExt, path::{Path, PathBuf}, process::exit, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc}, u64};
 
 use flume::Receiver;
 use gzp::{check::{Adler32, Check}, deflate::Zlib, par::compress::{ParCompress, ParCompressBuilder}, FormatSpec};
 use indicatif::{MultiProgress, ProgressBar};
 use serde::{Deserialize, Serialize};
-use serde_json::Deserializer;
 
 const EXT: &str = "zlib";
 const EXT_PARTIAL: &str = "comp_dat";
@@ -55,18 +54,19 @@ fn main() {
 
         let file_progress = ProgressBar::new(file_length);
         progress_bar.add(file_progress.clone());
-        let _ = compress_file.check_files();
         let (mut compressor, checksum_rx) = compress_file.to_compressor::<Zlib>().unwrap();
 
-        let mut total_byte_count = 0u64;
+        let mut total_byte_count = compress_file.get_starting_src_file_byte();
+
+        total_progress.set_position(total_byte_count);
 
         while let Ok(byte_count) = src_file.read_at(&mut data_buf, total_byte_count) {
             if byte_count == 0 { break; }
             let passed_data = &data_buf[0..byte_count];
             compressor.write_all(passed_data).unwrap();
-            file_progress.inc(byte_count as u64);
 
             total_byte_count += byte_count as u64;
+            file_progress.set_position(total_byte_count);
 
             if cancelled.load(Ordering::Relaxed) {
                 log::info!("Stopping compression because of CTRL+C! Stopped on file: {}", compress_file.src_filename.to_string_lossy());
@@ -103,7 +103,7 @@ fn main() {
             };
 
             let compressor_state = CompressorState::new(checksum, dict, total_byte_count);
-            log::info!("Writing Compressor State: `{:?}` to disk.", compressor_state);
+            log::info!("Writing Compressor State: `{}` to disk.", compressor_state);
             if let Err(e) = compressor_state.to_file(&compress_file.stp_filename) {
                 panic!("Error writing to compressed state file: {}! Error: {:?}.", compress_file.stp_filename.to_string_lossy(), e);
             }
@@ -128,7 +128,7 @@ impl FileToCompress {
 
         let src_filename = PathBuf::from_str(filename)?;
         let dst_filename = Self::extend_extension(&src_filename, EXT);
-        let stp_filename = Self::extend_extension(&dst_filename, EXT_PARTIAL);
+        let stp_filename = Self::make_hidden_filename(&Self::extend_extension(&dst_filename, EXT_PARTIAL));
 
         return Ok(Self {
             src_filename,
@@ -138,12 +138,25 @@ impl FileToCompress {
 
     }
 
+    /// Gets the location in the source file to continue from.
+    pub fn get_starting_src_file_byte(&self) -> u64 {
+        return self.get_compressor_state().map(|v| v.total_byte_count).unwrap_or(0);
+    }
+
     /// Adds an extention to the [`PathBuf`].
     /// Ex: foo.txt, rs => foo.txt.rs.
     ///     foo    , rs => foo.rs.
     pub(crate) fn extend_extension(src: &PathBuf, ext: &str) -> PathBuf {
         return src.with_extension(src.extension().map(|v| v.to_string_lossy().to_string() + ".").unwrap_or(String::new()) + ext);
     }
+
+    /// Adds an extention to the [`PathBuf`].
+    /// Ex: foo.txt => .foo.txt
+    ///     foo     => .foo
+    pub(crate) fn make_hidden_filename(src: &PathBuf) -> PathBuf {
+        return (String::from_str(".").unwrap() + &src.to_string_lossy()).into();
+    }
+
 
     /// Opens source file.
     pub fn get_src_file(&self) -> std::io::Result<File> {
@@ -154,10 +167,9 @@ impl FileToCompress {
     /// to do so.
     pub fn get_src_file_and_seek(&self) -> std::io::Result<File> {
 
-        let seek_to = self.get_compressor_state().map(|v| v.total_byte_count).unwrap_or(0);
         let mut file = self.get_src_file()?;
 
-        if let Err(e) = file.seek(SeekFrom::Start(seek_to)) {
+        if let Err(e) = file.seek(SeekFrom::Start(self.get_starting_src_file_byte())) {
             log::warn!("Failed to seek to area on file (for whatever reason). Error: {:?}.", e);
         }
 
@@ -169,30 +181,6 @@ impl FileToCompress {
     pub fn get_compressor_state(&self) -> Result<CompressorState, Box<dyn Error>> {
         let state = CompressorState::from_file(&self.stp_filename)?;
         return Ok(state);
-    }
-
-    pub fn check_files(&self) -> bool {
-
-        if !self.src_filename.is_file() {
-            return false;
-        }
-
-        // If the destination already exists
-        if self.dst_filename.is_file() {
-            // But the destination partial file doesn't
-            if !self.stp_filename.is_file() {
-                // It isn't good
-                return false;
-            }
-        }
-
-        if self.stp_filename.is_file() && !self.dst_filename.is_file() {
-            log::warn!("The partial compression file exists but the destination file itself doesn't! File: {}",
-                self.src_filename.to_string_lossy());
-        }
-
-        return true;
-
     }
 
     /// Creates a compressor based on the files that the struct is aware of.
@@ -303,4 +291,19 @@ impl CompressorState {
 
     }
 
+}
+
+impl std::fmt::Display for CompressorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+
+        let bytes_written = self.total_byte_count;
+        let checksum = self.checksum_serialized.clone();
+
+        let dictionary = match self.dictionary.is_some() {
+            true => "Set",
+            false => "Not Set",
+        }.to_string();
+
+        return write!(f, "CompressorState: {{ Bytes Written: {bytes_written} Bytes, Checksum: {checksum}, Dictionary: ({dictionary}) }}");
+    }
 }
