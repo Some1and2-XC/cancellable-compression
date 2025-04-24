@@ -1,4 +1,4 @@
-use std::{env, error::Error, ffi::OsString, fs::{self, File}, io::{Read, Seek, SeekFrom, Write}, os::unix::fs::FileExt, path::{Path, PathBuf}, process::exit, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc}, u64};
+use std::{env, error::Error, fs::{self, File}, io::{BufReader, Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, process::exit, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc}, u64};
 
 use flume::Receiver;
 use gzp::{check::{Adler32, Check}, deflate::Zlib, par::compress::{ParCompress, ParCompressBuilder}, FormatSpec};
@@ -42,7 +42,7 @@ fn main() {
             Err(_) => continue,
         };
 
-        let src_file = match compress_file.get_src_file_and_seek() {
+        let mut src_file = match compress_file.get_src_file_and_seek() {
             Ok(v) => v,
             Err(_) => {
                 eprintln!("Failed to find file: {:?}", file_name);
@@ -50,7 +50,7 @@ fn main() {
             },
         };
 
-        let file_length = src_file.metadata().map(|v| v.len()).unwrap_or(u64::MAX);
+        let file_length = src_file.get_ref().metadata().map(|v| v.len()).unwrap_or(u64::MAX);
 
         let file_progress = ProgressBar::new(file_length);
         progress_bar.add(file_progress.clone());
@@ -60,7 +60,7 @@ fn main() {
 
         total_progress.set_position(total_byte_count);
 
-        while let Ok(byte_count) = src_file.read_at(&mut data_buf, total_byte_count) {
+        while let Ok(byte_count) = src_file.read(&mut data_buf) {
             if byte_count == 0 { break; }
             let passed_data = &data_buf[0..byte_count];
             compressor.write_all(passed_data).unwrap();
@@ -70,9 +70,9 @@ fn main() {
 
             if cancelled.load(Ordering::Relaxed) {
                 log::info!("Stopping compression because of CTRL+C! Stopped on file: {}", compress_file.src_filename.to_string_lossy());
-
                 break;
             }
+
         }
 
         file_progress.finish_and_clear();
@@ -101,6 +101,15 @@ fn main() {
                 Ok(v) => v,
                 Err(_) => panic!("Failed to get checksum for partially compressed file: {}!", compress_file.dst_filename.to_string_lossy()),
             };
+
+            while let Ok(v) = checksum_rx.recv() {
+                log::error!("Here is an extra checksum value: {}",
+                    serde_json::to_string(&v).unwrap_or("FAILED_TO_SERIALIZE_CHECKSUM!".into())
+                    );
+            }
+
+            // Ensures the counts are correct.
+            assert_eq!(checksum.amount() as u64, total_byte_count);
 
             let compressor_state = CompressorState::new(checksum, dict, total_byte_count);
             log::info!("Writing Compressor State: `{}` to disk.", compressor_state);
@@ -154,18 +163,19 @@ impl FileToCompress {
     /// Ex: foo.txt => .foo.txt
     ///     foo     => .foo
     pub(crate) fn make_hidden_filename(src: &PathBuf) -> PathBuf {
-        return (String::from_str(".").unwrap() + &src.to_string_lossy()).into();
+        let mut out_src = src.clone();
+        out_src.set_file_name(format!(".{}", src.file_name().unwrap_or_default().to_string_lossy()));
+        return out_src;
     }
-
 
     /// Opens source file.
-    pub fn get_src_file(&self) -> std::io::Result<File> {
-        return File::open(&self.src_filename);
+    pub fn get_src_file(&self) -> std::io::Result<BufReader<File>> {
+        return Ok(BufReader::new(File::open(&self.src_filename)?));
     }
 
-    /// Opens source file to correct section and returns. Opens the compressor state file in order
+    /// Opens source file to the correct section and returns. Opens the compressor state file in order
     /// to do so.
-    pub fn get_src_file_and_seek(&self) -> std::io::Result<File> {
+    pub fn get_src_file_and_seek(&self) -> std::io::Result<BufReader<File>> {
 
         let mut file = self.get_src_file()?;
 
@@ -174,6 +184,34 @@ impl FileToCompress {
         }
 
         return Ok(file);
+    }
+
+    /// Opens the destination file to the correct section and returns. Checks to see if the stop
+    /// file exists, if it does but we need to create a new file, we remove the stop file. If we
+    /// don't need to create a new file but no stop file exists, we remove the existing file.
+    pub fn get_dst_file_and_seek(&self) -> std::io::Result<File> {
+
+        if self.stp_filename.is_file() {
+
+            if !self.dst_filename.is_file() {
+                let _ = fs::remove_file(&self.stp_filename);
+                return File::create(&self.dst_filename);
+            }
+
+            else {
+                return File::options()
+                    .append(true)
+                    .open(&self.dst_filename)
+                    ;
+            }
+
+        }
+
+        if self.dst_filename.is_file() {
+            let _ = fs::remove_file(&self.stp_filename);
+        }
+
+        return File::create(&self.dst_filename);
 
     }
 
@@ -192,39 +230,23 @@ impl FileToCompress {
 
         let (cs_tx, cs_rx) = ParCompressBuilder::<T>::checksum_channel();
 
-        let output_exists = self.stp_filename.is_file();
-
-        let out_file = match &self.dst_filename.is_file() {
-            true => {
-                if !output_exists {
-                    let _ = fs::remove_file(&self.dst_filename);
-                    File::create_new(&self.dst_filename)?
-                }
-                else {
-                    let mut file = File::options().write(true).open(&self.dst_filename)?;
-                    // Seeks to the end to ensure we keep writing to the correct spot.
-                    file.seek(SeekFrom::End(0))?;
-                    file
-                }
-            },
-            false => {
-                File::create_new(&self.dst_filename)?
-            },
-        };
+        // This is very unlikely to error.
+        let out_file = self.get_dst_file_and_seek()?;
 
         let mut builder = ParCompressBuilder::new()
             .checksum_dest(Some(cs_tx))
-            .write_header_on_start(!output_exists)
+            .write_header_on_start(!self.stp_filename.is_file())
             .write_footer_on_exit(false)
             ;
 
-        if output_exists {
+        if let Ok(compressor_config) = CompressorState::from_file(&self.stp_filename) {
 
-            let compressor_config = CompressorState::from_file(&self.stp_filename).unwrap();
-            builder = builder.dictionary(compressor_config.dictionary.map(|v| v.into()));
+            log::info!("Creating compressor with config: {}.", compressor_config);
 
+            // builder = builder.dictionary(compressor_config.dictionary.map(|v| v.into()));
+
+            // Gets checksum
             let mut deserializer = serde_json::Deserializer::from_str(&compressor_config.checksum_serialized);
-
             let check = Adler32::to_deserialized(&mut deserializer)?;
 
             builder = builder.checksum(Some(check.into()));
