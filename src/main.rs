@@ -1,7 +1,7 @@
 use std::{env, error::Error, fs::{self, File}, io::{BufReader, Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, process::exit, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc}, u64};
 
 use flume::Receiver;
-use gzp::{check::{Adler32, Check}, deflate::Zlib, par::compress::{ParCompress, ParCompressBuilder}, FormatSpec};
+use gzp::{check::{Adler32, Check}, deflate::Zlib, par::compress::{ParCompress, ParCompressBuilder}, Compression, FormatSpec};
 use indicatif::{MultiProgress, ProgressBar};
 use serde::{Deserialize, Serialize};
 
@@ -233,7 +233,10 @@ impl FileToCompress {
         // This is very unlikely to error.
         let out_file = self.get_dst_file_and_seek()?;
 
+        assert_eq!(Compression::best().level(), 9);
+
         let mut builder = ParCompressBuilder::new()
+            .compression_level(Compression::best())
             .checksum_dest(Some(cs_tx))
             .write_header_on_start(!self.stp_filename.is_file())
             .write_footer_on_exit(false)
